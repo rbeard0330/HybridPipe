@@ -7,92 +7,30 @@ import math
 
 import hybridpipe
 
-
-LOG_LEVEL = logging.INFO
+logging_status = True
+TEST_LOG_LEVEL = logging.ERROR
+MODULE_LOG_LEVEL = logging.ERROR
 global test_logger
-global logging_status
 test_logger = logging.getLogger(__name__)
 log_format = logging.Formatter(
     "{asctime}: {name} - {levelname}: "
     + "TEST_LOGGER"
     + ": {message}", style="{")
-test_logger.setLevel(logging.INFO)
+test_logger.setLevel(TEST_LOG_LEVEL)
 handler = logging.StreamHandler()
 handler.setFormatter(log_format)
 test_logger.addHandler(handler)
 
-logging_status = False
 
 
-def sync_sleep(t, stage=1):
-    if logging_status:
-        test_logger.debug(f"stage {stage} sync sleeping for {t}")
-    time.sleep(t)
-    return t
 
-
-def injectable_sync_sleep(stage=1, *,
-        pipeline_input_generator,
-        pipeline_error_queue_func,
-        pipeline_put_result_func,
-        pipeline_task_done_func):
-
-    for data in pipeline_input_generator():
-        if logging_status:
-            test_logger.debug(
-                f"stage {stage} async sleeping for {data}")
-        try:
-            time.sleep(data)
-            pipeline_task_done_func()
-            pipeline_put_result_func(data)
-        except Exception as e:
-            test_logger.debug(
-                f"stage {stage} encountered error {e}", exc_info=True)
-            pipeline_task_done_func()
-            error_dict = {
-                "data": data,
-                "exception": e
-            }
-            pipeline_error_queue_func(error_dict)
-
-
-async def async_sleep(t, stage=1):
-    if logging_status:
-        test_logger.debug(f"stage {stage} async sleeping for {t}")
-    await asyncio.sleep(t)
-    return t
-
-
-async def injectable_async_sleep(stage=1, *,
-        pipeline_input_generator,
-        pipeline_error_queue_func,
-        pipeline_put_result_func,
-        pipeline_task_done_func):
-
-    async for data in pipeline_input_generator():
-        if logging_status:
-            test_logger.debug(
-                f"stage {stage} async sleeping for {data}")
-        try:
-            await asyncio.sleep(data)
-            pipeline_task_done_func()
-            await pipeline_put_result_func(data)
-        except Exception as e:
-            test_logger.debug(
-                f"stage {stage} encountered error {e}", exc_info=True)
-            pipeline_task_done_func()
-            error_dict = {
-                "data": data,
-                "exception": e
-            }
-            pipeline_error_queue_func(error_dict)
 
 
 class TestPipelineBasicFunctions(unittest.TestCase):
 
     def setUp(self):
         self.workers = 5
-        self.log_level = logging.ERROR
+        self.log_level = MODULE_LOG_LEVEL
         self.data_lengths = [
             *[i for i in range(1, self.workers + 1)],
             self.workers + 1, 2 * self.workers, 5 * self.workers]
@@ -166,7 +104,9 @@ class TestPipelineBasicFunctions(unittest.TestCase):
         }
 
     def _run_pipeline(self, data, wrap=True, stages=2):
-        pipe = hybridpipe.HybridPipe(log_level=self.log_level)
+        base_config = {"workers": self.workers}
+        pipe = hybridpipe.HybridPipe(log_level=self.log_level,
+                                     default_config=base_config)
         pipe.register_resource(data)
         for n in range(1, stages + 1):
             if wrap:
@@ -178,6 +118,7 @@ class TestPipelineBasicFunctions(unittest.TestCase):
         start = time.perf_counter()
         results = pipe.execute()
         elapsed = time.perf_counter() - start
+        del pipe
         return results, elapsed
 
 
@@ -189,5 +130,72 @@ class TestPipelineFixedSize(unittest.TestCase):
     pass
 
 
+def sync_sleep(t, stage=1):
+    if logging_status:
+        test_logger.debug(f"stage {stage} sync sleeping for {t}")
+    time.sleep(t)
+    return t
+
+
+def injectable_sync_sleep(stage=1, *,
+        pipeline_input_generator,
+        pipeline_error_queue_func,
+        pipeline_put_result_func,
+        pipeline_task_done_func):
+
+    for data in pipeline_input_generator():
+        if logging_status:
+            test_logger.debug(
+                f"stage {stage} async sleeping for {data}")
+        try:
+            time.sleep(data)
+            pipeline_task_done_func()
+            pipeline_put_result_func(data)
+        except Exception as e:
+            test_logger.debug(
+                f"stage {stage} encountered error {e}", exc_info=True)
+            pipeline_task_done_func()
+            error_dict = {
+                "data": data,
+                "exception": e
+            }
+            pipeline_error_queue_func(error_dict)
+
+
+async def async_sleep(t, stage=1):
+    if logging_status:
+        test_logger.debug(f"stage {stage} async sleeping for {t}")
+    await asyncio.sleep(t)
+    return t
+
+
+async def injectable_async_sleep(stage=1, *,
+        pipeline_input_generator,
+        pipeline_error_queue_func,
+        pipeline_put_result_func,
+        pipeline_task_done_func):
+
+    async for data in pipeline_input_generator():
+        if logging_status:
+            test_logger.debug(
+                f"stage {stage} async sleeping for {data}")
+        try:
+            await asyncio.sleep(data)
+            pipeline_task_done_func()
+            await pipeline_put_result_func(data)
+        except Exception as e:
+            test_logger.debug(
+                f"stage {stage} encountered error {e}", exc_info=True)
+            pipeline_task_done_func()
+            error_dict = {
+                "data": data,
+                "exception": e
+            }
+            pipeline_error_queue_func(error_dict)
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

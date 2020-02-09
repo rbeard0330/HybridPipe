@@ -21,8 +21,7 @@ END OR]
 >> ... pipe.execute()
 
 TO DOS:
-Configuration
-Error handlers (exceptions currently go to a queue to die...)
+Stage-specific error handlers
 Permit chaining of pipelines
 Allow injected work functions to fork into multiple outputs
 """
@@ -62,17 +61,21 @@ class _PipeSegment():
             "pipeline_error_queue_func",
             "pipeline_put_result_func",
             "pipeline_task_done_func"]
+    CONFIG_PROPERTIES = [
+        "workers"
+    ]
+    DEFAULT_CONFIG = {
+        "workers": 1
+    }
 
-    def __init__(self, func, logger=None):
+    def __init__(self, func, config_dict=None, logger=None):
         self.func = func
         self.sig = inspect.signature(func, follow_wrapped=True)
         self.stored_args = []
         self.stored_kwargs = {}
-        self.config = {"workers": 5}
-        if logger is None:
-            self.logger = logging.getLogger(name=__name__)
-        else:
-            self.logger = logger
+        self.logger = logger or logging.getLogger(name=__name__)
+        config_dict = config_dict or self.DEFAULT_CONFIG
+        self.configure(**config_dict)
 
     def __call__(self, *args, _pipeline_reset=False, **kwargs):
         """Call object to apply static args to function. Returns updated
@@ -105,6 +108,17 @@ class _PipeSegment():
         self.logger.debug(f"stored {[*args]} and {kwargs}")
 
         return self
+
+    def configure(self, **kwargs):
+        """"if args:
+            raise TypeError("All configuration options should be specified by"
+                            + f" keyword: {self.CONFIG_PROPERTIES}")"""
+        for key, value in kwargs.items():
+            if key not in self.CONFIG_PROPERTIES:
+                raise KeyError(f"{key} is not a valid configuration property."
+                    + f" Valid properties are: {self.CONFIG_PROPERTIES}")
+            else:
+                setattr(self, key, value)
 
     def _unwrap(self, **pipeline_kwargs):
         assert len(pipeline_kwargs) == len(self.INTERNAL_KW_ARGS),\
@@ -159,8 +173,12 @@ class HybridPipe():
 
     def __init__(
             self, max_size=0,
+            default_config=None,
             logger=None, log_level=logging.WARNING,
             _pipe_id=0):
+
+        self.pipe_id = _pipe_id
+
         self.prod_error_queue = None
         self.cons_error_queue = None
         self.producers = []
@@ -169,11 +187,20 @@ class HybridPipe():
         self.output_func = None
         self.output_data = None
         self.output_pipe = None
-        self.pipe_id = _pipe_id
+        self.global_error_handler = None
+        self.default_error_handler = _PipeSegment(_default_error_handler)
+        self.default_config = default_config
+
         if logger is not None:
             self.logger = logger
         else:
             self.logger = logging.getLogger(name=__name__)
+            handlers = [*self.logger.handlers]
+            # inelegant, since it would remove a handler that wasn't installed
+            # by another instance of the __init__ method
+            for handler in handlers:
+                handler.close()
+                self.logger.removeHandler(handler)
             self.logger.setLevel(logging.DEBUG)
             time = str(datetime.datetime.now())\
                 .replace(" ", "-")\
@@ -203,6 +230,12 @@ class HybridPipe():
         iterable            Generator or iterable
         """
 
+        if self.resource:
+            raise TypeError(
+                "A resource has already been "
+                + f"registered: {self.resource}"
+            )
+
         self.logger.info(f"registered {iterable} as a resource")
 
         def resource_generator():
@@ -215,7 +248,47 @@ class HybridPipe():
         self.output_func = output_func
         self.logger.info(f"registered {output_func} as output")
 
-    def wrap_producer(self, awaitable):
+    def register_global_error_handler(self, handler, config_dict=None):
+        """Register simple error handler, which will be called for all errors.
+
+        Params:
+        handler: (sync func) Will be called on all errors that are passed to
+        the error queue by consumers or producers.
+        config_dict: (dict, optional) Keyword configuration properties for
+        function.
+
+        Returns:
+        Callable object that can be called with static parameters.
+        """
+
+        if self.global_error_handler:
+            raise TypeError(
+                "A global error handler has already been "
+                + f"registered: {self.global_error_handler}"
+            )
+        if inspect.iscoroutinefunction(func):
+            raise ValueError(
+                f"Global error handler must not be awaitable: {func}")
+
+        self.logger.info(f"registered {handler} as a global error handler")
+
+        @functools.wraps(handler)
+        def wrapped_handler(
+                *args,  # Static args
+                pipeline_input_generator,
+                pipeline_task_done_func,
+                **kwargs):  # <- static args
+            for error in pipeline_input_generator():
+                handler(error)
+                pipeline_task_done_func()
+
+        new_handler = _PipeSegment(
+            wrapped_handler,
+            config_dict=(config_dict or self.default_config))
+        self.global_error_handler = new_handler
+        return new_handler
+
+    def wrap_producer(self, awaitable, config_dict=None):
         """Wrap producer function.
 
         Params:
@@ -239,6 +312,7 @@ class HybridPipe():
             # Static arguments
             **kwargs
         ):
+            self.logger.debug(f"async task {awaitable.__name__} starting")
             async for data in pipeline_input_generator():
                 self.logger.debug(f"{awaitable} took {data} from the queue")
                 modified_args, modified_kwargs =\
@@ -266,13 +340,15 @@ class HybridPipe():
                     }
                     await pipeline_error_queue_func(error_dict)
             self.logger.debug(f"async task {awaitable.__name__} complete")
-            return True
+            return f"Wrapped producer task {awaitable.__name__} completed"
 
-        new_segment = _PipeSegment(wrapped_producer)
+        new_segment = _PipeSegment(
+            wrapped_producer,
+            config_dict=(config_dict or self.default_config))
         self.producers.append(new_segment)
         return new_segment
 
-    def inject_producer(self, awaitable):
+    def inject_producer(self, awaitable, config_dict=None):
         """Inject producer function.
 
         Injected functions receive 4 keyword arguments:
@@ -317,11 +393,13 @@ class HybridPipe():
                 pipeline_task_done_func=pipeline_task_done_func,
                 **kwargs)
 
-        new_segment = _PipeSegment(injected_producer)
+        new_segment = _PipeSegment(
+            injected_producer,
+            config_dict=(config_dict or self.default_config))
         self.producers.append(new_segment)
         return new_segment
 
-    def wrap_consumer(self, func):
+    def wrap_consumer(self, func, config_dict=None):
         """Wrap consumer function.
 
         Params:
@@ -369,13 +447,15 @@ class HybridPipe():
                     pipeline_task_done_func()
                     pipeline_error_queue_func(error_dict)
             self.logger.info(f"sync task {func.__name__} complete")
-            return True
+            return f"Wrapped consumer task {func.__name__} completed"
 
-        new_segment = _PipeSegment(wrapped_consumer)
+        new_segment = _PipeSegment(
+            wrapped_consumer,
+            config_dict=(config_dict or self.default_config))
         self.consumers.append(new_segment)
         return new_segment
 
-    def inject_consumer(self, func):
+    def inject_consumer(self, func, config_dict=None):
         """Inject consumer function.
 
         Params:
@@ -406,7 +486,9 @@ class HybridPipe():
                 pipeline_task_done_func=pipeline_task_done_func,
                 **kwargs)
 
-        new_segment = _PipeSegment(injected_consumer)
+        new_segment = _PipeSegment(
+            injected_consumer,
+            config_dict=(config_dict or self.default_config))
         self.consumers.append(new_segment)
         return new_segment
 
@@ -461,37 +543,39 @@ class HybridPipe():
             self.output_data = []
             self.output_func = self.output_data.append
 
-        asyncio.run(self._run_pipeline())
+        # Add specific error handlers later
+        if self.global_error_handler is None:
+            self.global_error_handler = self.default_error_handler
+
+        try:
+            asyncio.run(self._run_pipeline(), debug=True)
+        except Exception as e:
+            print(e)
 
         if self.output_data:
             return self.output_data
 
     async def _run_pipeline(self):
-        producer_tasks, consumer_tasks, segments, work_done_signal =\
-            await self._get_my_tasks()
+        async_tasks, sync_tasks, segments = await self._get_my_tasks()
 
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(consumer_tasks)) as pool:
-            self.logger.info(f"starting sync consumer tasks: {consumer_tasks}")
+                max_workers=len(sync_tasks)) as pool:
+            self.logger.info(f"starting sync consumer tasks: {sync_tasks}")
             thread_futures = [
                     asyncio.get_running_loop().run_in_executor(pool, task)
-                    for task in consumer_tasks
+                    for task in sync_tasks
                 ]
             self.logger.info(
-                f"starting async producer tasks: {producer_tasks}")
-            async_tasks = await asyncio.gather(
+                f"starting async producer tasks: {async_tasks}")
+            try:
+                results = await asyncio.gather(
                 *thread_futures,
-                *producer_tasks)
-
-            """while True:
-                if work_done_signal.is_set():
-                    self.logger.info("work done signal received")
-                    break
-                await asyncio.sleep(0.1)
-            self.logger.info("terminating processes")
-            for future in thread_futures:
-                future.cancel()
-            pool.shutdown(wait=False)"""
+                *async_tasks,
+                return_exceptions=False)
+            except Exception as e:
+                self.logger.exception(e)
+        self.logger.info(results)
+        await asyncio.sleep(.1)
 
     # ------------Assemble tasks---------------
 
@@ -500,12 +584,17 @@ class HybridPipe():
         resource_exhausted = asyncio.Event()
         resource_queue = AsyncQueue()
         pipeline = SyncQueue()
-        self.prod_error_queue = AsyncQueue()
-        self.cons_error_queue = SyncQueue()
         loader_task = self._loader_coro(
             self.resource, resource_queue, resource_exhausted)
         self.logger.debug(f"loader task created: {loader_task}")
-        work_done_signal = threading.Event()
+
+        # TOOD: Add specific error handlers
+        global_error_queue = SyncQueue()
+        global_error_queue_sync_put = partial(
+            global_error_queue.put, timeout=ERROR_TIMEOUT)
+        global_error_queue_async_put =\
+            _get_awaitable_sync_put(global_error_queue, ERROR_TIMEOUT)
+        error_processing_complete = threading.Event()
 
         # Create producer tasks
         interproducer_qs = [
@@ -521,7 +610,7 @@ class HybridPipe():
         producer_func_sets = [{
             "pipeline_input_generator": _build_async_generator(
                 resource_queue.get, producer_done_signals[1].is_set),
-            "pipeline_error_queue_func": self.prod_error_queue.put,
+            "pipeline_error_queue_func": global_error_queue_async_put,
             # None is placeholder that would be overwritten later
             "pipeline_put_result_func": (
                 interproducer_qs[0].put if interproducer_qs else None),
@@ -533,7 +622,7 @@ class HybridPipe():
                 "pipeline_input_generator": _build_async_generator(
                     interproducer_qs[ix].get,
                     producer_done_signals[ix + 2].is_set),
-                "pipeline_error_queue_func": self.prod_error_queue.put,
+                "pipeline_error_queue_func": global_error_queue_async_put,
                 "pipeline_put_result_func": interproducer_qs[ix + 1].put,
                 "pipeline_task_done_func": interproducer_qs[ix].task_done
             })
@@ -542,8 +631,8 @@ class HybridPipe():
             producer_func_sets.append({
                 "pipeline_input_generator": _build_async_generator(
                     interproducer_qs[-1].get,
-                    producer_done_signals[-1].is_set),
-                "pipeline_error_queue_func": self.prod_error_queue.put,
+                    producer_done_signals[-2].is_set),
+                "pipeline_error_queue_func": global_error_queue_async_put,
                 "pipeline_task_done_func": interproducer_qs[-1].task_done,
             })
 
@@ -552,24 +641,24 @@ class HybridPipe():
 
         assert len(self.producers) == len(producer_func_sets)
 
-        producer_tasks = []
+        async_tasks = []
         self.logger.debug(
             f"beginning to unwrap {len(self.producers)} producers")
         for ix, producer in enumerate(self.producers):
-            producer_tasks += [
+            async_tasks += [
                 producer._unwrap(**producer_func_sets[ix])()
-                for _ in range(producer.config["workers"])
+                for _ in range(producer.workers)
             ]
-        producer_tasks += [
+        async_tasks += [
             loader_task,
             self._producer_signal_monitor(
                 [resource_queue, *interproducer_qs],
                 producer_done_signals)
         ]
 
-        self.logger.debug(f"producers unwrapped: {producer_tasks}")
+        self.logger.debug(f"async tasks unwrapped: {async_tasks}")
 
-        # Create consumer tasks
+        # -----------Create consumer tasks-------------------
         interconsumer_qs = [
             SyncQueue() for _ in range(len(self.consumers) - 1)
         ]
@@ -584,8 +673,7 @@ class HybridPipe():
             "pipeline_input_generator": _build_sync_generator(
                 _wrapped_sync_get(pipeline, LOOP_TIMEOUT),
                 consumer_done_signals[0].is_set),
-            "pipeline_error_queue_func":
-                partial(self.cons_error_queue.put, timeout=ERROR_TIMEOUT),
+            "pipeline_error_queue_func": global_error_queue_sync_put,
             # None is placeholder that would be overwritten later
             "pipeline_put_result_func": (
                 partial(interconsumer_qs[0].put, timeout=ERROR_TIMEOUT)
@@ -600,8 +688,7 @@ class HybridPipe():
                     _wrapped_sync_get(interconsumer_qs[ix], LOOP_TIMEOUT),
                     consumer_done_signals[ix + 1].is_set
                 ),
-                "pipeline_error_queue_func":
-                    partial(self.cons_error_queue.put, timeout=ERROR_TIMEOUT),
+                "pipeline_error_queue_func": global_error_queue_sync_put,
                 "pipeline_put_result_func":
                     partial(interconsumer_qs[ix + 1].put,
                             timeout=ERROR_TIMEOUT),
@@ -614,8 +701,7 @@ class HybridPipe():
                     _wrapped_sync_get(interconsumer_qs[-1], LOOP_TIMEOUT),
                     consumer_done_signals[-1].is_set
                 ),
-                "pipeline_error_queue_func":
-                    partial(self.cons_error_queue.put, timeout=ERROR_TIMEOUT),
+                "pipeline_error_queue_func": global_error_queue_sync_put,
                 "pipeline_task_done_func": interconsumer_qs[-1].task_done
             })
 
@@ -625,28 +711,41 @@ class HybridPipe():
 
         self.logger.debug(
             f"beginning to unwrap {len(self.consumers)} consumers")
-        consumer_tasks = []
+        sync_tasks = []
         for ix, consumer in enumerate(self.consumers):
-            consumer_tasks += [
+            sync_tasks += [
                 consumer._unwrap(**consumer_func_sets[ix])
-                for _ in range(consumer.config["workers"])
+                for _ in range(consumer.workers)
             ]
 
         @functools.wraps(self._consumer_signal_monitor)
         def consumer_monitor():
-            self._consumer_signal_monitor(
-                [pipeline, *interconsumer_qs],
-                [producer_done_signals[-1], *consumer_done_signals],
-                work_done_signal)
+            return self._consumer_signal_monitor(
+                [pipeline, *interconsumer_qs, global_error_queue],
+                [
+                    producer_done_signals[-1],
+                    *consumer_done_signals,
+                    error_processing_complete
+                ])
 
-        consumer_tasks += [consumer_monitor]
-        self.logger.debug(f"consumers unwrapped: {consumer_tasks}")
+        sync_tasks.append(consumer_monitor)
+        sync_tasks.append(
+            self.global_error_handler._unwrap(
+                pipeline_input_generator=_build_sync_generator(
+                    _wrapped_sync_get(global_error_queue, LOOP_TIMEOUT),
+                    error_processing_complete.is_set),
+                pipeline_task_done_func=global_error_queue.task_done,
+                pipeline_put_result_func=None,
+                pipeline_error_queue_func=None
+            )
+        )
+        self.logger.debug(f"sync tasks unwrapped: {sync_tasks}")
         if self.output_pipe:
             self.logger.info("pulling tasks from another HybridPipe")
             new_p_tasks, new_c_tasks, new_segments =\
                 self.output_pipe._get_my_tasks()
-            producer_tasks += new_p_tasks
-            consumer_tasks += new_c_tasks
+            async_tasks += new_p_tasks
+            sync_tasks += new_c_tasks
             segments += new_segments
 
         # For debugging
@@ -658,7 +757,7 @@ class HybridPipe():
         }
         self.queues = queue_dict
 
-        return producer_tasks, consumer_tasks, segments, work_done_signal
+        return async_tasks, sync_tasks, segments
 
     # -------------Helper routines---------------------------
 
@@ -669,7 +768,7 @@ class HybridPipe():
         done_sig.set()
         self.logger.info(
             f"async loader task complete.  Queue size: {a_queue.qsize()}")
-        return True
+        return "Loader coroutine completed"
 
     async def _producer_signal_monitor(self, queues, signals):
         self.logger.debug("producer signal monitor started")
@@ -687,24 +786,27 @@ class HybridPipe():
         async_done_signal.set()  # thread-safe signal
         self.logger.debug("set thread-safe signal from producer queue")
         assert all(map(lambda s: s.is_set, signals))
-        return True
+        return "Producer signal monitor completed"
 
-    def _consumer_signal_monitor(self, queues, signals, done_signal):
+    def _consumer_signal_monitor(self, queues, signals):
         self.logger.debug("consumer signal monitor started")
         producer_signal = signals.pop(0)
         assert len(signals) == len(queues)
         producer_signal.wait()
         self.logger.debug("received signal from producers")
-        for ix, queue in enumerate(queues):
+        for ix, queue in enumerate(queues[:-1]):
             queue.join()
             self.logger.debug(f"consumer queue {ix} has joined")
             signals[ix].set()
             time.sleep(0.1)
         self.logger.info("all consumer queues closed")
+        queues[-1].join()  # Error queue
+        self.logger.debug(f"Error processing complete")
+        signals[-1].set()
         assert all(map(lambda s: s.is_set, signals))
-        done_signal.set()
-        self.logger.info("_consumer_signal_monitor set work_done signal")
-        return True
+        self.logger.info(
+            "_consumer_signal_monitor reports all sync tasks done")
+        return "Consumer signal monitor completed"
 
 
 def _build_async_generator(get_data_func,
@@ -728,8 +830,9 @@ def _build_async_generator(get_data_func,
     async def data_generator():
         while not await _await_ambiguous_function(termination_func):
             try:
-                yield await asyncio.wait_for(
+                data = await asyncio.wait_for(
                     _await_ambiguous_function(get_data_func), timeout)
+                yield data
             except asyncio.TimeoutError:
                 continue
 
@@ -761,7 +864,8 @@ def _build_sync_generator(get_data_func,
 async def _await_ambiguous_function(f, *args, **kwargs):
     "Await f with args if it is a sync function, else just call it."
     if inspect.iscoroutinefunction(f):
-        return await f(*args, **kwargs)
+        data = await f(*args, **kwargs)
+        return data
     return f(*args, **kwargs)
 
 
@@ -794,3 +898,10 @@ if __name__ == "__main__":
     except Exception as e:
         print("exception!")
         print(e)
+
+def _default_error_handler(
+        *, pipeline_input_generator, pipeline_task_done_func, **kwargs):
+    for error in pipeline_input_generator():
+        raise Exception(
+            f"An error occurred and no handler was provided: {error}")
+    return "Error handler completed"
